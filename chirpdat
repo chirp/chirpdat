@@ -1,0 +1,144 @@
+"""
+chirpdat.py
+
+Share folders of data with anyone nearby.
+This script uses the dat protocol to share data,
+and Chirp to broadcast the dat link using sound.
+
+npm install -g dat
+"""
+import argparse
+import codecs
+import configparser
+import os
+import subprocess
+import sys
+import time
+
+from chirpsdk import ChirpConnect, CallbackSet
+
+
+class Dat(object):
+
+    def __init__(self):
+        self._processes = []
+
+    def close(self):
+        for p in self._processes:
+            p.terminate()
+
+    def _call(self, cmd):
+        self._processes.append(subprocess.Popen(cmd.split(' '),
+            stdout=subprocess.PIPE, stdin=subprocess.PIPE,
+            stderr=subprocess.PIPE, universal_newlines=True
+        ))
+        return self._processes[-1]
+
+    def share(self, path):
+        link = None
+        cmd = 'dat share {path}'.format(path=os.path.expanduser(path))
+        p = self._call(cmd)
+        for no, line in enumerate(p.stdout):
+            if line.startswith('dat://'):
+                link = line[6:].strip()
+            if no > 3: break;
+        return link
+
+    def download(self, link, path):
+        cmd = 'dat clone {link} {path}'.format(
+            link=link, path=os.path.expanduser(path))
+        p = self._call(cmd)
+        cmd = 'dat sync {path}'.format(
+            link=link, path=os.path.expanduser(path))
+        p = self._call(cmd)
+
+
+class Callbacks(CallbackSet):
+
+    def __init__(self, dat, path):
+        self.dat = dat
+        self.path = path
+
+    def on_receiving(self, channel):
+        print('Receiving link...')
+
+    def on_received(self, payload, channel):
+        print('Syncing data to ' + self.path)
+        self.dat.download(str(payload), self.path)
+
+
+class Chirp(object):
+
+    def __init__(self):
+        config = configparser.ConfigParser()
+        config.read(os.path.expanduser('~/.chirprc'))
+
+        app_key = config.get('default', 'app_key')
+        app_secret = config.get('default', 'app_secret')
+        app_config = config.get('default', 'app_config')
+
+        self.sdk = ChirpConnect(app_key, app_secret, app_config)
+
+    def start(self):
+        self.sdk.start()
+
+    def send(self, data):
+        payload = self.sdk.new_payload(data)
+        self.sdk.send(payload)
+
+    def close(self):
+        self.sdk.stop()
+        self.sdk.close()
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(
+        description='Share folders with anyone nearby',
+        epilog='Uses the dat protocol and chirp to easily share data'
+    )
+    parser.add_argument('-s', '--share', type=str,
+        help='Path to folder to share, e.g., ~/Pictures')
+    parser.add_argument('-d', '--download', type=str,
+        help='Path to folder to download shared files to, e.g., ~/Downloads')
+    parser.add_argument('-l', action='store_true', default=False, help='List available audio devices')
+    parser.add_argument('-i', type=int, default=None, help='Input device index (optional)')
+    parser.add_argument('-o', type=int, default=None, help='Output device index (optional)')
+    args = parser.parse_args()
+
+    dat = Dat()
+    chirp = Chirp()
+
+    if args.l:
+        print(chirp.sdk.audio.query_devices())
+        sys.exit(0)
+
+    if args.i:
+        chirp.sdk.audio.input_device = args.i
+    if args.o:
+        chirp.sdk.audio.output_device = args.o
+
+    if not args.share and not args.download:
+        raise RuntimeError('Must specify a path to share, or a path to download to')
+
+    chirp.start()
+    print('Started. Type CTRL-C to exit')
+
+    if args.share:
+        link = dat.share(args.share)
+        print('Broadcasting link: {link}'.format(link=link))
+        if link:
+            chirp.send(codecs.decode(link, 'hex-codec'))
+        else:
+            raise RuntimeError('Failed to parse dat:// link')
+
+    if args.download:
+        chirp.sdk.set_callbacks(Callbacks(dat, args.download))
+
+    try:
+        while True:
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        print('Exiting')
+
+    chirp.close()
+    dat.close()
